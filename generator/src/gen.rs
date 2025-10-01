@@ -562,25 +562,31 @@ fn gen_bcs_def_for_type<HasSource: SourceKind>(
             Type::Datatype(dt) => {
                 let module_env = env.module(dt.module);
 
-                let struct_env = todo_panic_if_enum(&module_env, dt.name);
-                let class = import_ctx.get_class(&struct_env);
+                match module_env.datatype(dt.name) {
+                    Datatype::Struct(struct_env) => {
+                        let class = import_ctx.get_class(&struct_env);
 
-                toks.append(Item::Literal(ItemStr::from("${")));
-                quote_in! { *toks => $(class).$$typeName };
-                toks.append(Item::Literal(ItemStr::from("}")));
+                        toks.append(Item::Literal(ItemStr::from("${")));
+                        quote_in! { *toks => $(class).$$typeName };
+                        toks.append(Item::Literal(ItemStr::from("}")));
 
-                let ts = &dt.type_arguments;
-                if !ts.is_empty() {
-                    quote_in! { *toks => < };
-                    let len = ts.len();
-                    for (i, ty) in ts.iter().enumerate() {
-                        inner(toks, ty, env, type_param_names, import_ctx);
-                        if i != len - 1 {
-                            quote_in! { *toks => , };
-                            toks.space()
+                        let ts = &dt.type_arguments;
+                        if !ts.is_empty() {
+                            quote_in! { *toks => < };
+                            let len = ts.len();
+                            for (i, ty) in ts.iter().enumerate() {
+                                inner(toks, ty, env, type_param_names, import_ctx);
+                                if i != len - 1 {
+                                    quote_in! { *toks => , };
+                                    toks.space()
+                                }
+                            }
+                            quote_in! { *toks => > };
                         }
                     }
-                    quote_in! { *toks => > };
+                    Datatype::Enum(_) => {
+                        quote_in! { *toks => };
+                    }
                 }
             }
             Type::Vector(ty) => {
@@ -704,13 +710,7 @@ impl<'a, 'model, HasSource: SourceKind> FunctionsGen<'a, 'model, HasSource> {
                         .field_name_from_type(ty, type_param_names)?
                         .to_case(Case::Pascal)
             }
-            Type::Datatype(dt) => {
-                let module = self.func.model().module(dt.module);
-                todo_panic_if_enum(&module, dt.name)
-                    .name()
-                    .to_string()
-                    .to_case(Case::Camel)
-            }
+            Type::Datatype(dt) => dt.name.to_string().to_case(Case::Camel),
             Type::Reference(_, ty) => self.field_name_from_type(ty, type_param_names)?,
             Type::TypeParameter(idx) => type_param_names[*idx as usize]
                 .to_owned()
@@ -1137,39 +1137,46 @@ impl<'a, 'model, HasSource: SourceKind> StructsGen<'a, 'model, HasSource> {
             Type::Datatype(dt) => {
                 let field_module = self.strct.model().module(dt.module);
 
-                let field_strct = todo_panic_if_enum(&field_module, dt.name);
-                let class = self.import_ctx.get_class(&field_strct);
+                match field_module.datatype(dt.name) {
+                    Datatype::Struct(field_strct) => {
+                        let class = self.import_ctx.get_class(&field_strct);
 
-                let strct_type_params = &self.strct.compiled().type_parameters;
-                let field_strct_type_params = &field_strct.compiled().type_parameters;
-                let type_param_inner_toks = dt.type_arguments.iter().enumerate().map(|(idx, t)| {
-                    let is_phantom = field_strct_type_params[idx].is_phantom;
-                    let wrap_to_phantom = is_phantom
-                        && match t {
-                            Type::TypeParameter(t_idx) => {
-                                !strct_type_params[*t_idx as usize].is_phantom
-                            }
-                            Type::Datatype(_) | Type::Vector(_) => true,
-                            _ => false,
-                        };
+                        let strct_type_params = &self.strct.compiled().type_parameters;
+                        let field_strct_type_params = &field_strct.compiled().type_parameters;
+                        let type_param_inner_toks =
+                            dt.type_arguments.iter().enumerate().map(|(idx, t)| {
+                                let is_phantom = field_strct_type_params[idx].is_phantom;
+                                let wrap_to_phantom = is_phantom
+                                    && match t {
+                                        Type::TypeParameter(t_idx) => {
+                                            !strct_type_params[*t_idx as usize].is_phantom
+                                        }
+                                        Type::Datatype(_) | Type::Vector(_) => true,
+                                        _ => false,
+                                    };
 
-                    let inner = self.gen_struct_class_field_type_inner(
-                        t,
-                        type_param_names,
-                        wrap_non_phantom_type_parameter.clone(),
-                        wrap_phantom_type_parameter.clone(),
-                        false,
-                    );
-                    if wrap_to_phantom {
-                        quote!($to_phantom<$inner>)
-                    } else {
-                        quote!($inner)
+                                let inner = self.gen_struct_class_field_type_inner(
+                                    t,
+                                    type_param_names,
+                                    wrap_non_phantom_type_parameter.clone(),
+                                    wrap_phantom_type_parameter.clone(),
+                                    false,
+                                );
+                                if wrap_to_phantom {
+                                    quote!($to_phantom<$inner>)
+                                } else {
+                                    quote!($inner)
+                                }
+                            });
+
+                        quote!($class$(if !dt.type_arguments.is_empty() {
+                            <$(for param in type_param_inner_toks join (, ) => $param)>
+                        }))
                     }
-                });
-
-                quote!($class$(if !dt.type_arguments.is_empty() {
-                    <$(for param in type_param_inner_toks join (, ) => $param)>
-                }))
+                    Datatype::Enum(_) => {
+                        quote!()
+                    }
+                }
             }
             Type::TypeParameter(idx) => {
                 let ty = type_param_names[*idx as usize].clone();
@@ -1256,19 +1263,24 @@ impl<'a, 'model, HasSource: SourceKind> StructsGen<'a, 'model, HasSource> {
             }
             Type::Datatype(dt) => {
                 let field_module = self.strct.model().module(dt.module);
-                let field_strct = todo_panic_if_enum(&field_module, dt.name);
+                match field_module.datatype(dt.name) {
+                    Datatype::Struct(field_strct) => {
+                        let class = self.import_ctx.get_class(&field_strct);
+                        let field_strct_type_params = &field_strct.compiled().type_parameters;
+                        let non_phantom_param_idxs = (0..dt.type_arguments.len())
+                            .filter(|idx| !field_strct_type_params[*idx].is_phantom)
+                            .collect::<Vec<_>>();
 
-                let class = self.import_ctx.get_class(&field_strct);
-                let field_strct_type_params = &field_strct.compiled().type_parameters;
-                let non_phantom_param_idxs = (0..dt.type_arguments.len())
-                    .filter(|idx| !field_strct_type_params[*idx].is_phantom)
-                    .collect::<Vec<_>>();
-
-                quote!($class.bcs$(if !non_phantom_param_idxs.is_empty() {
-                    ($(for idx in non_phantom_param_idxs join (, ) =>
-                        $(self.gen_struct_bcs_def_field_value(&dt.type_arguments[idx], type_param_names))
-                    ))
-                }))
+                        quote!($class.bcs$(if !non_phantom_param_idxs.is_empty() {
+                            ($(for idx in non_phantom_param_idxs join (, ) =>
+                                $(self.gen_struct_bcs_def_field_value(&dt.type_arguments[idx], type_param_names))
+                            ))
+                        }))
+                    }
+                    Datatype::Enum(_) => {
+                        quote!()
+                    }
+                }
             }
             Type::TypeParameter(idx) => {
                 quote!($(type_param_names[*idx as usize].to_owned()))
@@ -1294,33 +1306,38 @@ impl<'a, 'model, HasSource: SourceKind> StructsGen<'a, 'model, HasSource> {
             }
             Type::Datatype(dt) => {
                 let field_module = self.strct.model().module(dt.module);
+                match field_module.datatype(dt.name) {
+                    Datatype::Struct(field_strct) => {
+                        let class = self.import_ctx.get_class(&field_strct);
 
-                let field_strct = todo_panic_if_enum(&field_module, dt.name);
-                let class = self.import_ctx.get_class(&field_strct);
+                        let strct_type_params = &self.strct.compiled().type_parameters;
+                        let field_strct_type_params = &field_strct.compiled().type_parameters;
+                        let ts = &dt.type_arguments;
+                        let toks = ts.iter().enumerate().map(|(idx, ty)| {
+                            let wrap_to_phantom = field_strct_type_params[idx].is_phantom
+                                && match &ts[idx] {
+                                    Type::TypeParameter(t_idx) => {
+                                        !strct_type_params[*t_idx as usize].is_phantom
+                                    }
+                                    _ => true,
+                                };
 
-                let strct_type_params = &self.strct.compiled().type_parameters;
-                let field_strct_type_params = &field_strct.compiled().type_parameters;
-                let ts = &dt.type_arguments;
-                let toks = ts.iter().enumerate().map(|(idx, ty)| {
-                    let wrap_to_phantom = field_strct_type_params[idx].is_phantom
-                        && match &ts[idx] {
-                            Type::TypeParameter(t_idx) => {
-                                !strct_type_params[*t_idx as usize].is_phantom
+                            let inner = self.gen_reified(ty, type_param_names);
+                            if wrap_to_phantom {
+                                quote!($reified.phantom($inner))
+                            } else {
+                                quote!($inner)
                             }
-                            _ => true,
-                        };
+                        });
 
-                    let inner = self.gen_reified(ty, type_param_names);
-                    if wrap_to_phantom {
-                        quote!($reified.phantom($inner))
-                    } else {
-                        quote!($inner)
+                        quote!($class.reified($(if !ts.is_empty() {
+                            $(for t in toks join (, ) => $t)
+                        })))
                     }
-                });
-
-                quote!($class.reified($(if !ts.is_empty() {
-                    $(for t in toks join (, ) => $t)
-                })))
+                    Datatype::Enum(_) => {
+                        quote!()
+                    }
+                }
             }
             Type::TypeParameter(idx) => {
                 quote!($(type_param_names[*idx as usize].clone()))
@@ -1709,543 +1726,547 @@ impl<'a, 'model, HasSource: SourceKind> StructsGen<'a, 'model, HasSource> {
         let strct_type_arity = type_params.len();
         let fields = self.strct.compiled().fields.0.clone();
         quote_in! { *tokens =>
-            export class $(&struct_name)$(self.gen_params_toks(type_params.clone(), &extends_type_argument, &extends_phantom_type_argument)) implements $struct_class {
-                __StructClass = true as const;$['\n']
+                    export class $(&struct_name)$(self.gen_params_toks(type_params.clone(), &extends_type_argument, &extends_phantom_type_argument)) implements $struct_class {
+                        __StructClass = true as const;$['\n']
 
-                static readonly $$typeName = $(self.gen_full_name_with_address(true, false));
-                static readonly $$numTypeParams = $(type_params.len());
-                static readonly $$isPhantom = $is_phantom_value_toks as const;$['\n']
+                        static readonly $$typeName = $(self.gen_full_name_with_address(true, false));
+                        static readonly $$numTypeParams = $(type_params.len());
+                        static readonly $$isPhantom = $is_phantom_value_toks as const;$['\n']
 
-                $(if is_option {
-                    __inner: $(&type_params[0]) = null as unknown as $(&type_params[0]); $(ref toks => {
-                        toks.append("// for type checking in reified.ts")
-                    })$['\n'];
-                })
+                        $(if is_option {
+                            __inner: $(&type_params[0]) = null as unknown as $(&type_params[0]); $(ref toks => {
+                                toks.append("// for type checking in reified.ts")
+                            })$['\n'];
+                        })
 
-                readonly $$typeName = $(&struct_name).$$typeName;
-                readonly $$fullTypeName: $static_full_type_name_as_toks;
-                readonly $$typeArgs: $type_args_field_type;
-                readonly $$isPhantom = $(&struct_name).$$isPhantom;$['\n']
+                        readonly $$typeName = $(&struct_name).$$typeName;
+                        readonly $$fullTypeName: $static_full_type_name_as_toks;
+                        readonly $$typeArgs: $type_args_field_type;
+                        readonly $$isPhantom = $(&struct_name).$$isPhantom;$['\n']
 
-                $(for (_, field) in &fields join (; ) =>
-                    readonly $(gen_field_name(field.name)):
-                        $(self.gen_struct_class_field_type(
-                            &field.type_, &self.strct_type_param_names(), None, None
-                        ))
-                )$['\n']
+                        $(for (_, field) in &fields join (; ) =>
+                            readonly $(gen_field_name(field.name)):
+                                $(self.gen_struct_class_field_type(
+                                    &field.type_, &self.strct_type_param_names(), None, None
+                                ))
+                        )$['\n']
 
-                private constructor(typeArgs: $type_args_field_type, $(match fields.len() {
-                        0 => (),
-                        _ => { fields: $(self.gen_fields_if_name_with_params(&ExtendsOrWraps::None, &ExtendsOrWraps::None)), }
-                    })
-                ) {
-                    this.$$fullTypeName = $compose_sui_type(
-                            $(&struct_name).$$typeName,
-                            ...typeArgs
-                    ) as $static_full_type_name_as_toks;
-                    this.$$typeArgs = typeArgs;$['\n']
-
-                    $(match fields.len() {
-                        0 => (),
-                        _ => {
-                            $(for (_, field) in &fields join (; ) =>
-                                this.$(gen_field_name(field.name)) = fields.$(gen_field_name(field.name));
-                            )
-                        }
-                    })
-                }$['\n']
-
-
-                static reified$(params_toks_for_reified)(
-                    $(for param in type_params.iter() join (, ) => $param: $param)
-                ): $(&struct_name)Reified$(
-                    self.gen_params_toks(type_params.clone(), &wraps_to_type_argument, &wraps_phantom_to_type_argument)
-                ) {
-                    const reifiedBcs = $(&struct_name).bcs$(if !non_phantom_params.is_empty() {
-                        ($(for param in &non_phantom_params join (, ) => $to_bcs($param)))
-                    });
-                    return {
-                        typeName: $(&struct_name).$$typeName,
-                        fullTypeName: $compose_sui_type(
-                            $(&struct_name).$$typeName,
-                            ...[$(for param in &type_params join (, ) => $extract_type($param))]
-                        ) as $reified_full_type_name_as_toks,
-                        typeArgs: [
-                            $(for param in &type_params join (, ) => $extract_type($param))
-                        ] as $reified_type_args_as_toks,
-                        isPhantom: $(&struct_name).$$isPhantom,
-                        reifiedTypeArgs: [$(for param in &type_params join (, ) => $param)],
-                        fromFields: (fields: Record<string, any>) =>
-                            $(&struct_name).fromFields(
-                                $(match type_params.len() {
-                                    0 => (),
-                                    1 => { $(type_params[0].clone()), },
-                                    _ => { [$(for param in &type_params join (, ) => $param)], },
-                                })
-                                fields,
-                            ),
-                        fromFieldsWithTypes: (item: $fields_with_types) =>
-                            $(&struct_name).fromFieldsWithTypes(
-                                $(match type_params.len() {
-                                    0 => (),
-                                    1 => { $(type_params[0].clone()), },
-                                    _ => { [$(for param in &type_params join (, ) => $param)], },
-                                })
-                                item,
-                            ),
-                        fromBcs: (data: Uint8Array) =>
-                            $(&struct_name).fromFields(
-                                $(match type_params.len() {
-                                    0 => (),
-                                    1 => { $(type_params[0].clone()), },
-                                    _ => { [$(for param in &type_params join (, ) => $param)], },
-                                })
-                                reifiedBcs.parse(data)
-                            ),
-                        bcs: reifiedBcs,
-                        fromJSONField: (field: any) =>
-                            $(&struct_name).fromJSONField(
-                                $(match type_params.len() {
-                                    0 => (),
-                                    1 => { $(type_params[0].clone()), },
-                                    _ => { [$(for param in &type_params join (, ) => $param)], },
-                                })
-                                field,
-                            ),
-                        fromJSON: (json: Record<string, any>) =>
-                            $(&struct_name).fromJSON(
-                                $(match type_params.len() {
-                                    0 => (),
-                                    1 => { $(type_params[0].clone()), },
-                                    _ => { [$(for param in &type_params join (, ) => $param)], },
-                                })
-                                json,
-                            ),
-                        fromSuiParsedData: (content: $sui_parsed_data) =>
-                            $(&struct_name).fromSuiParsedData(
-                                $(match type_params.len() {
-                                    0 => (),
-                                    1 => { $(type_params[0].clone()), },
-                                    _ => { [$(for param in &type_params join (, ) => $param)], },
-                                })
-                                content,
-                            ),
-                        fromSuiObjectData: (content: $sui_object_data) =>
-                            $(&struct_name).fromSuiObjectData(
-                                $(match type_params.len() {
-                                    0 => (),
-                                    1 => { $(type_params[0].clone()), },
-                                    _ => { [$(for param in &type_params join (, ) => $param)], },
-                                })
-                                content,
-                            ),
-                        fetch: async (client: $sui_client, id: string) => $(&struct_name).fetch(
-                            client,
-                            $(match type_params.len() {
+                        private constructor(typeArgs: $type_args_field_type, $(match fields.len() {
                                 0 => (),
-                                1 => { $(type_params[0].clone()), },
-                                _ => { [$(for param in &type_params join (, ) => $param)], },
+                                _ => { fields: $(self.gen_fields_if_name_with_params(&ExtendsOrWraps::None, &ExtendsOrWraps::None)), }
                             })
-                            id,
-                        ),
-                        new: (
+                        ) {
+                            this.$$fullTypeName = $compose_sui_type(
+                                    $(&struct_name).$$typeName,
+                                    ...typeArgs
+                            ) as $static_full_type_name_as_toks;
+                            this.$$typeArgs = typeArgs;$['\n']
+
                             $(match fields.len() {
                                 0 => (),
-                                _ => { fields: $(self.gen_fields_if_name_with_params(&wraps_to_type_argument, &wraps_phantom_to_type_argument)), }
+                                _ => {
+                                    $(for (_, field) in &fields join (; ) =>
+                                        this.$(gen_field_name(field.name)) = fields.$(gen_field_name(field.name));
+                                    )
+                                }
                             })
-                        ) => {
-                            return new $(&struct_name)(
-                                [$(for param in &type_params join (, ) => $extract_type($param))],
+                        }$['\n']
+
+
+                        static reified$(params_toks_for_reified)(
+                            $(for param in type_params.iter() join (, ) => $param: $param)
+                        ): $(&struct_name)Reified$(
+                            self.gen_params_toks(type_params.clone(), &wraps_to_type_argument, &wraps_phantom_to_type_argument)
+                        ) {
+                            const reifiedBcs = $(&struct_name).bcs$(if !non_phantom_params.is_empty() {
+                                ($(for param in &non_phantom_params join (, ) => $to_bcs($param)))
+                            });
+                            return {
+                                typeName: $(&struct_name).$$typeName,
+                                fullTypeName: $compose_sui_type(
+                                    $(&struct_name).$$typeName,
+                                    ...[$(for param in &type_params join (, ) => $extract_type($param))]
+                                ) as $reified_full_type_name_as_toks,
+                                typeArgs: [
+                                    $(for param in &type_params join (, ) => $extract_type($param))
+                                ] as $reified_type_args_as_toks,
+                                isPhantom: $(&struct_name).$$isPhantom,
+                                reifiedTypeArgs: [$(for param in &type_params join (, ) => $param)],
+                                fromFields: (fields: Record<string, any>) =>
+                                    $(&struct_name).fromFields(
+                                        $(match type_params.len() {
+                                            0 => (),
+                                            1 => { $(type_params[0].clone()), },
+                                            _ => { [$(for param in &type_params join (, ) => $param)], },
+                                        })
+                                        fields,
+                                    ),
+                                fromFieldsWithTypes: (item: $fields_with_types) =>
+                                    $(&struct_name).fromFieldsWithTypes(
+                                        $(match type_params.len() {
+                                            0 => (),
+                                            1 => { $(type_params[0].clone()), },
+                                            _ => { [$(for param in &type_params join (, ) => $param)], },
+                                        })
+                                        item,
+                                    ),
+                                fromBcs: (data: Uint8Array) =>
+                                    $(&struct_name).fromFields(
+                                        $(match type_params.len() {
+                                            0 => (),
+                                            1 => { $(type_params[0].clone()), },
+                                            _ => { [$(for param in &type_params join (, ) => $param)], },
+                                        })
+                                        reifiedBcs.parse(data)
+                                    ),
+                                bcs: reifiedBcs,
+                                fromJSONField: (field: any) =>
+                                    $(&struct_name).fromJSONField(
+                                        $(match type_params.len() {
+                                            0 => (),
+                                            1 => { $(type_params[0].clone()), },
+                                            _ => { [$(for param in &type_params join (, ) => $param)], },
+                                        })
+                                        field,
+                                    ),
+                                fromJSON: (json: Record<string, any>) =>
+                                    $(&struct_name).fromJSON(
+                                        $(match type_params.len() {
+                                            0 => (),
+                                            1 => { $(type_params[0].clone()), },
+                                            _ => { [$(for param in &type_params join (, ) => $param)], },
+                                        })
+                                        json,
+                                    ),
+                                fromSuiParsedData: (content: $sui_parsed_data) =>
+                                    $(&struct_name).fromSuiParsedData(
+                                        $(match type_params.len() {
+                                            0 => (),
+                                            1 => { $(type_params[0].clone()), },
+                                            _ => { [$(for param in &type_params join (, ) => $param)], },
+                                        })
+                                        content,
+                                    ),
+                                fromSuiObjectData: (content: $sui_object_data) =>
+                                    $(&struct_name).fromSuiObjectData(
+                                        $(match type_params.len() {
+                                            0 => (),
+                                            1 => { $(type_params[0].clone()), },
+                                            _ => { [$(for param in &type_params join (, ) => $param)], },
+                                        })
+                                        content,
+                                    ),
+                                fetch: async (client: $sui_client, id: string) => $(&struct_name).fetch(
+                                    client,
+                                    $(match type_params.len() {
+                                        0 => (),
+                                        1 => { $(type_params[0].clone()), },
+                                        _ => { [$(for param in &type_params join (, ) => $param)], },
+                                    })
+                                    id,
+                                ),
+                                new: (
+                                    $(match fields.len() {
+                                        0 => (),
+                                        _ => { fields: $(self.gen_fields_if_name_with_params(&wraps_to_type_argument, &wraps_phantom_to_type_argument)), }
+                                    })
+                                ) => {
+                                    return new $(&struct_name)(
+                                        [$(for param in &type_params join (, ) => $extract_type($param))],
+                                        $(match fields.len() {
+                                            0 => (),
+                                            _ => fields,
+                                        })
+                                    )
+                                },
+                                kind: "StructClassReified",
+                            }
+                        }$['\n']
+
+                        static get r() {
+                            $(if type_params.is_empty() {
+                                return $(&struct_name).reified()
+                            } else {
+                                return $(&struct_name).reified
+                            })
+                        }$['\n']
+
+                        static phantom$(params_toks_for_reified)(
+                            $(for param in type_params.iter() join (, ) => $param: $param)
+                        ): $phantom_reified<$to_type_str<$(&struct_name)$(params_toks_for_to_type_argument)>> {
+                            return $phantom($(&struct_name).reified(
+                                $(for param in type_params.iter() join (, ) => $param)
+                            ));
+                        }
+
+                        static get p() {
+                            $(if type_params.is_empty() {
+                                return $(&struct_name).phantom()
+                            } else {
+                                return $(&struct_name).phantom
+                            })
+                        }$['\n']
+
+                        private static instantiateBcs() {
+                            return $(if !non_phantom_params.is_empty() {
+                                <$(for param in non_phantom_params.iter() join (, ) =>
+                                    $param extends $bcs_type<any>
+                                )>($(for param in non_phantom_params.iter() join (, ) =>
+                                    $param: $param
+                                )) =>
+                            }) $bcs.struct($bcs_def_name, {$['\n']
+                                $(for (_, field) in &fields join (, ) =>
+                                    $(field.name.to_string()):
+                                        $(self.gen_struct_bcs_def_field_value(&field.type_, &self.strct_type_param_names()))
+                                )$['\n']
+                            $['\n']})
+                        };$['\n']
+
+                        private static cachedBcs: ReturnType<typeof $(&struct_name).instantiateBcs> | null = null;$['\n']
+
+                        static get bcs() {
+                            if (!$(&struct_name).cachedBcs) {
+                                $(&struct_name).cachedBcs = $(&struct_name).instantiateBcs()
+                            }
+                            return $(&struct_name).cachedBcs
+                        };$['\n']
+
+                        static fromFields$(params_toks_for_reified)(
+                            $type_args_param_if_any fields: Record<string, any>
+                        ): $(&struct_name)$(params_toks_for_to_type_argument) {
+                            return $(&struct_name).reified(
+                                $(match type_params.len() {
+                                    0 => (),
+                                    1 => { typeArg, },
+                                    _ => { $(for idx in 0..type_params.len() join (, ) => typeArgs[$idx]), },
+                                })
+                            ).new(
                                 $(match fields.len() {
                                     0 => (),
-                                    _ => fields,
+                                    _ => {{
+                                        $(for (_, field) in &fields join (, ) =>
+                                            $(gen_field_name(field.name)): $(self.gen_from_fields_field_decode(strct_type_arity, field.name, &field.type_))
+                                        )
+                                    }}
                                 })
                             )
-                        },
-                        kind: "StructClassReified",
-                    }
-                }$['\n']
+                        }$['\n']
 
-                static get r() {
-                    $(if type_params.is_empty() {
-                        return $(&struct_name).reified()
-                    } else {
-                        return $(&struct_name).reified
-                    })
-                }$['\n']
+                        static fromFieldsWithTypes$(params_toks_for_reified)(
+                            $type_args_param_if_any item: $fields_with_types
+                        ): $(&struct_name)$(params_toks_for_to_type_argument) {
+                            if (!is$(&struct_name)(item.type)) {
+                                throw new Error($[str]($[const](format!("not a {} type", &struct_name))));$['\n']
+                            }
+                            $(ref toks {
+                                if !type_params.is_empty() {
+                                    let type_args_name = match type_params.len() {
+                                        1 => quote!([typeArg]),
+                                        _ => quote!(typeArgs),
+                                    };
+                                     quote_in!(*toks =>
+                                        $assert_fields_with_types_args_match(item, $type_args_name);
+                                     )
+                                }
+                            })$['\n']
 
-                static phantom$(params_toks_for_reified)(
-                    $(for param in type_params.iter() join (, ) => $param: $param)
-                ): $phantom_reified<$to_type_str<$(&struct_name)$(params_toks_for_to_type_argument)>> {
-                    return $phantom($(&struct_name).reified(
-                        $(for param in type_params.iter() join (, ) => $param)
-                    ));
-                }
+                            return $(&struct_name).reified(
+                                $(match type_params.len() {
+                                    0 => (),
+                                    1 => { typeArg, },
+                                    _ => { $(for idx in 0..type_params.len() join (, ) => typeArgs[$idx]), },
+                                })
+                            ).new(
+                                $(match fields.len() {
+                                    0 => (),
+                                    _ => {{
+                                        $(for (_, field) in &fields join (, ) =>
+                                            $(gen_field_name(field.name)): $(self.gen_from_fields_with_types_field_decode(strct_type_arity, field.name, &field.type_))
+                                        )
+                                    }}
+                                })
+                            )
+                        }$['\n']
 
-                static get p() {
-                    $(if type_params.is_empty() {
-                        return $(&struct_name).phantom()
-                    } else {
-                        return $(&struct_name).phantom
-                    })
-                }$['\n']
+                        static fromBcs$(params_toks_for_reified)(
+                            $type_args_param_if_any data: Uint8Array
+                        ): $(&struct_name)$(params_toks_for_to_type_argument) {
+                            $(if type_params.len() == 1 && !non_phantom_params.is_empty() {
+                                const typeArgs = [typeArg];$['\n']
+                            })
 
-                private static instantiateBcs() {
-                    return $(if !non_phantom_params.is_empty() {
-                        <$(for param in non_phantom_params.iter() join (, ) =>
-                            $param extends $bcs_type<any>
-                        )>($(for param in non_phantom_params.iter() join (, ) =>
-                            $param: $param
-                        )) =>
-                    }) $bcs.struct($bcs_def_name, {$['\n']
-                        $(for (_, field) in &fields join (, ) =>
-                            $(field.name.to_string()):
-                                $(self.gen_struct_bcs_def_field_value(&field.type_, &self.strct_type_param_names()))
-                        )$['\n']
-                    $['\n']})
-                };$['\n']
+                            return $(&struct_name).fromFields(
+                                $(match type_params.len() {
+                                    0 => (),
+                                    1 => { typeArg, },
+                                    _ => { typeArgs, },
+                                })
+                                $(match non_phantom_params.len() {
+                                    0 => $(&struct_name).bcs.parse(data),
+                                    len => $(&struct_name).bcs(
+                                        $(for i in 0..len join (, ) => $to_bcs(typeArgs[$(non_phantom_param_idxs[i])]))
+                                    ).parse(data),
+                                })
+                            )
+                        }$['\n']
 
-                private static cachedBcs: ReturnType<typeof $(&struct_name).instantiateBcs> | null = null;$['\n']
+                        toJSONField() {
+                            return {$['\n']
+                                $(ref toks {
+                                    let this_type_args = |idx: usize| quote!(this.$$typeArgs[$idx]);
+                                    let type_param_names = (0..strct_type_arity)
+                                        .map(|idx| QuoteItem::Interpolated(this_type_args(idx)))
+                                        .collect::<Vec<_>>();
 
-                static get bcs() {
-                    if (!$(&struct_name).cachedBcs) {
-                        $(&struct_name).cachedBcs = $(&struct_name).instantiateBcs()
-                    }
-                    return $(&struct_name).cachedBcs
-                };$['\n']
+                                    for (_, field) in fields.iter() {
+                                        let name = gen_field_name(field.name);
+                                        let this_name = quote!(this.$(gen_field_name(field.name)));
 
-                static fromFields$(params_toks_for_reified)(
-                    $type_args_param_if_any fields: Record<string, any>
-                ): $(&struct_name)$(params_toks_for_to_type_argument) {
-                    return $(&struct_name).reified(
-                        $(match type_params.len() {
-                            0 => (),
-                            1 => { typeArg, },
-                            _ => { $(for idx in 0..type_params.len() join (, ) => typeArgs[$idx]), },
-                        })
-                    ).new(
-                        $(match fields.len() {
-                            0 => (),
-                            _ => {{
-                                $(for (_, field) in &fields join (, ) =>
-                                    $(gen_field_name(field.name)): $(self.gen_from_fields_field_decode(strct_type_arity, field.name, &field.type_))
-                                )
-                            }}
-                        })
-                    )
-                }$['\n']
+                                        let field_type_param = self.gen_struct_class_field_type_inner(
+                                            &field.type_, &self.strct_type_param_names(), None, None, false
+                                        );
 
-                static fromFieldsWithTypes$(params_toks_for_reified)(
-                    $type_args_param_if_any item: $fields_with_types
-                ): $(&struct_name)$(params_toks_for_to_type_argument) {
-                    if (!is$(&struct_name)(item.type)) {
-                        throw new Error($[str]($[const](format!("not a {} type", &struct_name))));$['\n']
-                    }
-                    $(ref toks {
-                        if !type_params.is_empty() {
-                            let type_args_name = match type_params.len() {
-                                1 => quote!([typeArg]),
-                                _ => quote!(typeArgs),
-                            };
-                             quote_in!(*toks =>
-                                $assert_fields_with_types_args_match(item, $type_args_name);
-                             )
-                        }
-                    })$['\n']
+                                        match &field.type_ {
+                                            Type::Datatype(dt) => {
+                                                let field_module = self.strct.model().module(dt.module);
+                                                match field_module.datatype(dt.name) {
+                                                    Datatype::Struct(field_strct) => {
+                                                    // handle special types
+                                                    let (fs_a, fs_m, fs_n) = strct_qualified_member_name(&field_strct, self.type_origin_table);
+                                                    match (fs_a, fs_m.as_str(), fs_n.as_str()) {
+                                                        (AccountAddress::ONE, "string", "String") |    (AccountAddress::ONE, "ascii", "String")  => {
+                                                            quote_in!(*toks => $name: $this_name,)
+                                                        }
+                                                        (AccountAddress::TWO, "url", "Url") => {
+                                                            quote_in!(*toks => $name: $this_name,)
+                                                        }
+                                                        (AccountAddress::TWO, "object", "ID") => {
+                                                            quote_in!(*toks => $name: $this_name,)
+                                                        }
+                                                        (AccountAddress::TWO, "object", "UID") => {
+                                                            quote_in!(*toks => $name: $this_name, )
+                                                        }
+                                                        (AccountAddress::ONE, "option", "Option") => {
+                                                            let type_name = self.gen_bcs_def_for_type(&field.type_, &type_param_names);
+                                                            quote_in!(*toks => $name: $field_to_json<$field_type_param>($type_name, $this_name),)
+                                                        }
+                                                        _ => {
+                                                            quote_in!(*toks => $name: $this_name.toJSONField(),)
+                                                        }
+                                                    }}
 
-                    return $(&struct_name).reified(
-                        $(match type_params.len() {
-                            0 => (),
-                            1 => { typeArg, },
-                            _ => { $(for idx in 0..type_params.len() join (, ) => typeArgs[$idx]), },
-                        })
-                    ).new(
-                        $(match fields.len() {
-                            0 => (),
-                            _ => {{
-                                $(for (_, field) in &fields join (, ) =>
-                                    $(gen_field_name(field.name)): $(self.gen_from_fields_with_types_field_decode(strct_type_arity, field.name, &field.type_))
-                                )
-                            }}
-                        })
-                    )
-                }$['\n']
-
-                static fromBcs$(params_toks_for_reified)(
-                    $type_args_param_if_any data: Uint8Array
-                ): $(&struct_name)$(params_toks_for_to_type_argument) {
-                    $(if type_params.len() == 1 && !non_phantom_params.is_empty() {
-                        const typeArgs = [typeArg];$['\n']
-                    })
-
-                    return $(&struct_name).fromFields(
-                        $(match type_params.len() {
-                            0 => (),
-                            1 => { typeArg, },
-                            _ => { typeArgs, },
-                        })
-                        $(match non_phantom_params.len() {
-                            0 => $(&struct_name).bcs.parse(data),
-                            len => $(&struct_name).bcs(
-                                $(for i in 0..len join (, ) => $to_bcs(typeArgs[$(non_phantom_param_idxs[i])]))
-                            ).parse(data),
-                        })
-                    )
-                }$['\n']
-
-                toJSONField() {
-                    return {$['\n']
-                        $(ref toks {
-                            let this_type_args = |idx: usize| quote!(this.$$typeArgs[$idx]);
-                            let type_param_names = (0..strct_type_arity)
-                                .map(|idx| QuoteItem::Interpolated(this_type_args(idx)))
-                                .collect::<Vec<_>>();
-
-                            for (_, field) in fields.iter() {
-                                let name = gen_field_name(field.name);
-                                let this_name = quote!(this.$(gen_field_name(field.name)));
-
-                                let field_type_param = self.gen_struct_class_field_type_inner(
-                                    &field.type_, &self.strct_type_param_names(), None, None, false
-                                );
-
-                                match &field.type_ {
-                                    Type::Datatype(dt) => {
-                                        let field_module = self.strct.model().module(dt.module);
-                                        let field_strct = todo_panic_if_enum(&field_module, dt.name);
-
-                                        // handle special types
-                                        let (fs_a, fs_m, fs_n) = strct_qualified_member_name(&field_strct, self.type_origin_table);
-                                        match (fs_a, fs_m.as_str(), fs_n.as_str()) {
-                                            (AccountAddress::ONE, "string", "String") |    (AccountAddress::ONE, "ascii", "String")  => {
+                                                Datatype::Enum(_) => {quote_in!(*toks => ,)
+        }
+                                            }
+                                            }
+                                            Type::U64 | Type::U128 | Type::U256 => {
+                                                quote_in!(*toks => $name: $this_name.toString(),)
+                                            }
+                                            Type::U8 |
+                                            Type::U16 | Type::U32 | Type::Bool | Type::Address => {
                                                 quote_in!(*toks => $name: $this_name,)
                                             }
-                                            (AccountAddress::TWO, "url", "Url") => {
-                                                quote_in!(*toks => $name: $this_name,)
-                                            }
-                                            (AccountAddress::TWO, "object", "ID") => {
-                                                quote_in!(*toks => $name: $this_name,)
-                                            }
-                                            (AccountAddress::TWO, "object", "UID") => {
-                                                quote_in!(*toks => $name: $this_name, )
-                                            }
-                                            (AccountAddress::ONE, "option", "Option") => {
+                                            Type::Vector(_) => {
                                                 let type_name = self.gen_bcs_def_for_type(&field.type_, &type_param_names);
+
                                                 quote_in!(*toks => $name: $field_to_json<$field_type_param>($type_name, $this_name),)
                                             }
-                                            _ => {
-                                                quote_in!(*toks => $name: $this_name.toJSONField(),)
+                                            Type::TypeParameter(i) => {
+                                                quote_in!(*toks => $name: $field_to_json<$field_type_param>($(this_type_args(*i as usize)), $this_name),)
                                             }
+                                            _ => {
+                                                let name = gen_field_name(field.name);
+                                                quote_in!(*toks => $name: $this_name.toJSONField(),)
+                                            },
+
                                         }
                                     }
-                                    Type::U64 | Type::U128 | Type::U256 => {
-                                        quote_in!(*toks => $name: $this_name.toString(),)
-                                    }
-                                    Type::U8 |
-                                    Type::U16 | Type::U32 | Type::Bool | Type::Address => {
-                                        quote_in!(*toks => $name: $this_name,)
-                                    }
-                                    Type::Vector(_) => {
-                                        let type_name = self.gen_bcs_def_for_type(&field.type_, &type_param_names);
-
-                                        quote_in!(*toks => $name: $field_to_json<$field_type_param>($type_name, $this_name),)
-                                    }
-                                    Type::TypeParameter(i) => {
-                                        quote_in!(*toks => $name: $field_to_json<$field_type_param>($(this_type_args(*i as usize)), $this_name),)
-                                    }
-                                    _ => {
-                                        let name = gen_field_name(field.name);
-                                        quote_in!(*toks => $name: $this_name.toJSONField(),)
-                                    },
-
-                                }
-                            }
-                        })
-                    $['\n']}
-                }$['\n']
-
-                toJSON() {
-                    return {
-                        $$typeName: this.$$typeName,
-                        $$typeArgs: this.$$typeArgs,
-                        ...this.toJSONField()
-                    }
-                }$['\n']
-
-                static fromJSONField$(params_toks_for_reified)(
-                    $type_args_param_if_any field: any
-                ): $(&struct_name)$(params_toks_for_to_type_argument) {
-                    return $(&struct_name).reified(
-                        $(match type_params.len() {
-                            0 => (),
-                            1 => { typeArg, },
-                            _ => { $(for idx in 0..type_params.len() join (, ) => typeArgs[$idx]), },
-                        })
-                    ).new(
-                        $(match fields.len() {
-                            0 => (),
-                            _ => {{
-                                $(for (_, field) in &fields join (, ) =>
-                                    $(gen_field_name(field.name)): $(self.gen_from_json_field_field_decode(strct_type_arity, field.name, &field.type_))
-                                )
-                            }}
-                        })
-                    )
-                }$['\n']
-
-                static fromJSON$(params_toks_for_reified)(
-                    $type_args_param_if_any json: Record<string, any>
-                ): $(&struct_name)$(params_toks_for_to_type_argument) {
-                    if (json.$$typeName !==  $(&struct_name).$$typeName) {
-                        throw new Error("not a WithTwoGenerics json object")
-                    };
-                    $(if !type_params.is_empty() {
-                        $assert_reified_type_args_match(
-                            $compose_sui_type($(&struct_name).$$typeName,
-                            $(match type_params.len() {
-                                1 => { $extract_type(typeArg) },
-                                _ => { ...typeArgs.map($extract_type) },
-                            })),
-                            json.$$typeArgs,
-                            $(match type_params.len() {
-                                1 => { [typeArg] },
-                                _ => { typeArgs },
-                            }),
-                        )
-                    })$['\n']
-
-                    return $(&struct_name).fromJSONField(
-                        $(match type_params.len() {
-                            0 => (),
-                            1 => { typeArg, },
-                            _ => { typeArgs, },
-                        })
-                        json,
-                    )
-                }$['\n']
-
-                static fromSuiParsedData$(params_toks_for_reified)(
-                    $type_args_param_if_any content: $sui_parsed_data
-                ): $(&struct_name)$(params_toks_for_to_type_argument) {
-                    if (content.dataType !== "moveObject") {
-                        throw new Error("not an object");
-                    }
-                    if (!is$(&struct_name)(content.type)) {
-                        throw new Error($(self.interpolate(
-                            format!("object at ${{(content.fields as any).id}} is not a {} object", &struct_name))
-                        ));
-                    }
-                    return $(&struct_name).fromFieldsWithTypes(
-                        $(match type_params.len() {
-                            0 => (),
-                            1 => { typeArg, },
-                            _ => { typeArgs, },
-                        })
-                        content
-                    );
-                }$['\n']
-
-                static fromSuiObjectData$(params_toks_for_reified)(
-                    $type_args_param_if_any data: $sui_object_data
-                ): $(&struct_name)$(params_toks_for_to_type_argument) {
-                    if (data.bcs) {
-                        if (data.bcs.dataType !== "moveObject" || !is$(&struct_name)(data.bcs.type)) {
-                            throw new Error($(self.interpolate(
-                                format!("object at is not a {} object", &struct_name))
-                            ));
+                                })
+                            $['\n']}
                         }$['\n']
-                        $(match type_params.len() {
-                            0 => (),
-                            1 => {
-                                const gotTypeArgs = $parse_type_name(data.bcs.type).typeArgs;
-                                if (gotTypeArgs.length !== 1) {
-                                    throw new Error($(self.interpolate(
-                                        "type argument mismatch: expected 1 type argument but got '${gotTypeArgs.length}'".to_string()
-                                    )));
-                                };
-                                const gotTypeArg = $compress_sui_type(gotTypeArgs[0]);
-                                const expectedTypeArg = $compress_sui_type($extract_type(typeArg));
-                                if (gotTypeArg !== $compress_sui_type($extract_type(typeArg))) {
-                                    throw new Error($(self.interpolate(
-                                        "type argument mismatch: expected '${expectedTypeArg}' but got '${gotTypeArg}'".to_string()
-                                    )));
-                                };
-                            },
-                            n => {
-                                const gotTypeArgs = $parse_type_name(data.bcs.type).typeArgs;
-                                if (gotTypeArgs.length !== $n) {
-                                    throw new Error($(self.interpolate(
-                                        format!("type argument mismatch: expected {} type arguments but got ${{gotTypeArgs.length}}", n)
-                                    )));
-                                };
-                                for (let i = 0; i < $n; i++) {
-                                    const gotTypeArg = $compress_sui_type(gotTypeArgs[i]);
-                                    const expectedTypeArg = $compress_sui_type($extract_type(typeArgs[i]));
-                                    if (gotTypeArg !== expectedTypeArg) {
-                                        throw new Error($(self.interpolate(
-                                            "type argument mismatch at position ${i}: expected '${expectedTypeArg}' but got '${gotTypeArg}'".to_string()
-                                        )));
-                                    }
-                                };
+
+                        toJSON() {
+                            return {
+                                $$typeName: this.$$typeName,
+                                $$typeArgs: this.$$typeArgs,
+                                ...this.toJSONField()
                             }
-                        })$['\n']
+                        }$['\n']
 
-                        return $(&struct_name).fromBcs(
-                            $(match type_params.len() {
-                                0 => (),
-                                1 => { typeArg, },
-                                _ => { typeArgs, },
-                            })
-                            $from_b64(data.bcs.bcsBytes)
-                        );
+                        static fromJSONField$(params_toks_for_reified)(
+                            $type_args_param_if_any field: any
+                        ): $(&struct_name)$(params_toks_for_to_type_argument) {
+                            return $(&struct_name).reified(
+                                $(match type_params.len() {
+                                    0 => (),
+                                    1 => { typeArg, },
+                                    _ => { $(for idx in 0..type_params.len() join (, ) => typeArgs[$idx]), },
+                                })
+                            ).new(
+                                $(match fields.len() {
+                                    0 => (),
+                                    _ => {{
+                                        $(for (_, field) in &fields join (, ) =>
+                                            $(gen_field_name(field.name)): $(self.gen_from_json_field_field_decode(strct_type_arity, field.name, &field.type_))
+                                        )
+                                    }}
+                                })
+                            )
+                        }$['\n']
+
+                        static fromJSON$(params_toks_for_reified)(
+                            $type_args_param_if_any json: Record<string, any>
+                        ): $(&struct_name)$(params_toks_for_to_type_argument) {
+                            if (json.$$typeName !==  $(&struct_name).$$typeName) {
+                                throw new Error("not a WithTwoGenerics json object")
+                            };
+                            $(if !type_params.is_empty() {
+                                $assert_reified_type_args_match(
+                                    $compose_sui_type($(&struct_name).$$typeName,
+                                    $(match type_params.len() {
+                                        1 => { $extract_type(typeArg) },
+                                        _ => { ...typeArgs.map($extract_type) },
+                                    })),
+                                    json.$$typeArgs,
+                                    $(match type_params.len() {
+                                        1 => { [typeArg] },
+                                        _ => { typeArgs },
+                                    }),
+                                )
+                            })$['\n']
+
+                            return $(&struct_name).fromJSONField(
+                                $(match type_params.len() {
+                                    0 => (),
+                                    1 => { typeArg, },
+                                    _ => { typeArgs, },
+                                })
+                                json,
+                            )
+                        }$['\n']
+
+                        static fromSuiParsedData$(params_toks_for_reified)(
+                            $type_args_param_if_any content: $sui_parsed_data
+                        ): $(&struct_name)$(params_toks_for_to_type_argument) {
+                            if (content.dataType !== "moveObject") {
+                                throw new Error("not an object");
+                            }
+                            if (!is$(&struct_name)(content.type)) {
+                                throw new Error($(self.interpolate(
+                                    format!("object at ${{(content.fields as any).id}} is not a {} object", &struct_name))
+                                ));
+                            }
+                            return $(&struct_name).fromFieldsWithTypes(
+                                $(match type_params.len() {
+                                    0 => (),
+                                    1 => { typeArg, },
+                                    _ => { typeArgs, },
+                                })
+                                content
+                            );
+                        }$['\n']
+
+                        static fromSuiObjectData$(params_toks_for_reified)(
+                            $type_args_param_if_any data: $sui_object_data
+                        ): $(&struct_name)$(params_toks_for_to_type_argument) {
+                            if (data.bcs) {
+                                if (data.bcs.dataType !== "moveObject" || !is$(&struct_name)(data.bcs.type)) {
+                                    throw new Error($(self.interpolate(
+                                        format!("object at is not a {} object", &struct_name))
+                                    ));
+                                }$['\n']
+                                $(match type_params.len() {
+                                    0 => (),
+                                    1 => {
+                                        const gotTypeArgs = $parse_type_name(data.bcs.type).typeArgs;
+                                        if (gotTypeArgs.length !== 1) {
+                                            throw new Error($(self.interpolate(
+                                                "type argument mismatch: expected 1 type argument but got '${gotTypeArgs.length}'".to_string()
+                                            )));
+                                        };
+                                        const gotTypeArg = $compress_sui_type(gotTypeArgs[0]);
+                                        const expectedTypeArg = $compress_sui_type($extract_type(typeArg));
+                                        if (gotTypeArg !== $compress_sui_type($extract_type(typeArg))) {
+                                            throw new Error($(self.interpolate(
+                                                "type argument mismatch: expected '${expectedTypeArg}' but got '${gotTypeArg}'".to_string()
+                                            )));
+                                        };
+                                    },
+                                    n => {
+                                        const gotTypeArgs = $parse_type_name(data.bcs.type).typeArgs;
+                                        if (gotTypeArgs.length !== $n) {
+                                            throw new Error($(self.interpolate(
+                                                format!("type argument mismatch: expected {} type arguments but got ${{gotTypeArgs.length}}", n)
+                                            )));
+                                        };
+                                        for (let i = 0; i < $n; i++) {
+                                            const gotTypeArg = $compress_sui_type(gotTypeArgs[i]);
+                                            const expectedTypeArg = $compress_sui_type($extract_type(typeArgs[i]));
+                                            if (gotTypeArg !== expectedTypeArg) {
+                                                throw new Error($(self.interpolate(
+                                                    "type argument mismatch at position ${i}: expected '${expectedTypeArg}' but got '${gotTypeArg}'".to_string()
+                                                )));
+                                            }
+                                        };
+                                    }
+                                })$['\n']
+
+                                return $(&struct_name).fromBcs(
+                                    $(match type_params.len() {
+                                        0 => (),
+                                        1 => { typeArg, },
+                                        _ => { typeArgs, },
+                                    })
+                                    $from_b64(data.bcs.bcsBytes)
+                                );
+                            }
+                            if (data.content) {
+                                return $(&struct_name).fromSuiParsedData(
+                                    $(match type_params.len() {
+                                        0 => (),
+                                        1 => { typeArg, },
+                                        _ => { typeArgs, },
+                                    })
+                                    data.content
+                                )
+                            }
+
+                            throw new Error(
+                                "Both `bcs` and `content` fields are missing from the data. Include `showBcs` or `showContent` in the request."
+                            );
+                        }$['\n']
+
+                        static async fetch$(params_toks_for_reified)(
+                            client: $sui_client, $type_args_param_if_any id: string
+                        ): Promise<$(&struct_name)$(params_toks_for_to_type_argument)> {
+                            const res = await client.getObject({
+                                id,
+                                options: {
+                                    showBcs: true,
+                                },
+                            });
+                            if (res.error) {
+                                throw new Error($(self.interpolate(
+                                    format!("error fetching {} object at id ${{id}}: ${{res.error.code}}", &struct_name))
+                                ));
+                            }
+                            if (res.data?.bcs?.dataType !== "moveObject" || !is$(&struct_name)(res.data.bcs.type)) {
+                                throw new Error($(self.interpolate(
+                                    format!("object at id ${{id}} is not a {} object", &struct_name))
+                                ));
+                            }$['\n']
+
+                            return $(&struct_name).fromSuiObjectData(
+                                $(match type_params.len() {
+                                    0 => (),
+                                    1 => { typeArg, },
+                                    _ => { typeArgs, },
+                                })
+                                res.data
+                            );
+                        }$['\n']
                     }
-                    if (data.content) {
-                        return $(&struct_name).fromSuiParsedData(
-                            $(match type_params.len() {
-                                0 => (),
-                                1 => { typeArg, },
-                                _ => { typeArgs, },
-                            })
-                            data.content
-                        )
-                    }
-
-                    throw new Error(
-                        "Both `bcs` and `content` fields are missing from the data. Include `showBcs` or `showContent` in the request."
-                    );
-                }$['\n']
-
-                static async fetch$(params_toks_for_reified)(
-                    client: $sui_client, $type_args_param_if_any id: string
-                ): Promise<$(&struct_name)$(params_toks_for_to_type_argument)> {
-                    const res = await client.getObject({
-                        id,
-                        options: {
-                            showBcs: true,
-                        },
-                    });
-                    if (res.error) {
-                        throw new Error($(self.interpolate(
-                            format!("error fetching {} object at id ${{id}}: ${{res.error.code}}", &struct_name))
-                        ));
-                    }
-                    if (res.data?.bcs?.dataType !== "moveObject" || !is$(&struct_name)(res.data.bcs.type)) {
-                        throw new Error($(self.interpolate(
-                            format!("object at id ${{id}} is not a {} object", &struct_name))
-                        ));
-                    }$['\n']
-
-                    return $(&struct_name).fromSuiObjectData(
-                        $(match type_params.len() {
-                            0 => (),
-                            1 => { typeArg, },
-                            _ => { typeArgs, },
-                        })
-                        res.data
-                    );
-                }$['\n']
-            }
-        }
+                }
         tokens.line()
     }
 
